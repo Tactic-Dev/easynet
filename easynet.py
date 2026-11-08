@@ -17,7 +17,7 @@ try:
 except (ValueError, ImportError):
     XApp = None
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_ID = "dev.tacticdev.easynet"
 AP_FLAGS = getattr(NM, "80211ApFlags")
 AP_SEC = getattr(NM, "80211ApSecurityFlags")
@@ -88,6 +88,8 @@ class Net:
                     "active-connection-added", "active-connection-removed", "connection-added", "connection-removed"):
             self.c.connect(sig, lambda *_: self.changed())
         for d in self.c.get_devices(): self._watch_dev(d)
+        for ac in self.c.get_active_connections(): ac.connect("notify::state", lambda *_: self.changed())
+        self.c.connect("active-connection-added", lambda _c, ac: ac.connect("notify::state", lambda *_: self.changed()))
         self.c.connect("device-added", lambda _c, d: self._watch_dev(d))
         self.tailscale = {}
         threading.Thread(target=self._tailscale_loop, daemon=True).start()
@@ -139,6 +141,23 @@ class Net:
                 out.append(conn)
         return sorted(out, key=lambda c: c.get_id().lower())
 
+    def by_type(self, *types):
+        return sorted([c for c in self.c.get_connections() if c.get_connection_type() in types],
+                      key=lambda c: c.get_id().lower())
+
+    def active_for(self, conn):
+        for ac in self.c.get_active_connections():
+            if ac.get_uuid() == conn.get_uuid():
+                return ac
+        return None
+
+    def activate(self, conn, cb):
+        self.c.activate_connection_async(conn, None, None, None,
+                                         lambda c, res: self._finish(c.activate_connection_finish, res, cb), None)
+
+    def deactivate(self, ac, cb):
+        self.c.deactivate_connection_async(ac, None, lambda c, res: self._finish(c.deactivate_connection_finish, res, cb), None)
+
     def saved_for_ssid(self, ssid):
         for conn in self.saved_wifi():
             if ssid_text(conn.get_setting_wireless().get_ssid()) == ssid:
@@ -160,9 +179,9 @@ class Net:
         return sorted(best.items(), key=lambda kv: (kv[0] != active_ssid, -kv[1].get_strength()))
 
     # ---- actions ----
-    def set_wifi(self, on):
+    def set_wifi(self, on, cb=None):
         self.c.dbus_set_property(NM.DBUS_PATH, NM.DBUS_INTERFACE, "WirelessEnabled", GLib.Variant("b", on),
-                                 -1, None, None, None)
+                                 -1, None, lambda c, res: self._finish(c.dbus_set_property_finish, res, cb), None)
 
     def scan(self):
         d = self.wifi_dev()
@@ -333,7 +352,8 @@ class App(Gtk.Application):
         m.append(Gtk.SeparatorMenuItem())
         if self.net.wifi_dev():
             on = self.net.c.wireless_get_enabled()
-            item("Turn Wi-Fi off" if on else "Turn Wi-Fi on", lambda: self.net.set_wifi(not on))
+            item("Turn Wi-Fi off" if on else "Turn Wi-Fi on",
+                 lambda: self.net.set_wifi(not on, lambda e: e and self.flash("Wi-Fi: " + self.explain(e))))
         if self.net.tailscale.get("state") in ("Running", "Stopped"):
             running = self.net.tailscale["state"] == "Running"
             item("Turn Tailscale off" if running else "Turn Tailscale on", lambda: self.toggle_tailscale(not running))
@@ -391,19 +411,14 @@ class App(Gtk.Application):
                                 max_content_height=260)
         self.wifi_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         sc.add(self.wifi_list)
+        self.wifi_scroll = sc; sc.set_no_show_all(True)
         card.pack_start(sc, False, False, 0)
 
-        # tailscale
-        self.ts_box = Gtk.Box(spacing=10)
-        tl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        tt = Gtk.Label(label="Tailscale", xalign=0); tt.get_style_context().add_class("en-section")
-        self.ts_detail = Gtk.Label(xalign=0); self.ts_detail.get_style_context().add_class("en-dim")
-        tl.pack_start(tt, False, False, 0); tl.pack_start(self.ts_detail, False, False, 0)
-        self.ts_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
-        self.ts_sw.connect("notify::active", lambda s, _p: None if self._updating else self.toggle_tailscale(s.get_active()))
-        self.ts_box.pack_start(tl, True, True, 0); self.ts_box.pack_end(self.ts_sw, False, False, 0)
-        self.ts_box.set_no_show_all(True)
-        card.pack_start(self.ts_box, False, False, 0)
+        # VPN (Tailscale + saved VPN/WireGuard connections) and phone tethering
+        self.vpn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        card.pack_start(self.vpn_box, False, False, 0)
+        self.tether_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        card.pack_start(self.tether_box, False, False, 0)
 
         foot = Gtk.Box(spacing=4)
         for label, fn in (("Saved Wi-Fi…", self.open_saved), ("Network settings…", self.open_settings)):
@@ -462,15 +477,8 @@ class App(Gtk.Application):
             self.portal_btn.set_visible(conn == NM.ConnectivityState.PORTAL)
             self.refresh_wired()
             self.refresh_wifi()
-            ts = self.net.tailscale
-            if ts.get("state") in ("Running", "Stopped", "NeedsLogin", "Starting"):
-                self.ts_sw.set_active(ts["state"] in ("Running", "Starting"))
-                self.ts_detail.set_text({"Running": f"On · {ts.get('ip', '')}", "Stopped": "Off",
-                                         "Starting": "Starting…", "NeedsLogin": "Needs sign-in (run: tailscale up)"}[ts["state"]])
-                for c in self.ts_box.get_children(): c.show_all()
-                self.ts_box.show()
-            else:
-                self.ts_box.hide()
+            self.refresh_vpn()
+            self.refresh_tether()
         finally:
             self._updating = False
         self.notify_changes()
@@ -493,12 +501,102 @@ class App(Gtk.Application):
             b = self._row(name, "network-wired-symbolic", sub, active=state == NM.DeviceState.ACTIVATED)
             if state == NM.DeviceState.ACTIVATED:
                 b.set_tooltip_text("Click to disconnect")
-                b.connect("clicked", lambda _b, d=d: self.net.disconnect(d, lambda e: e and self.flash(e)))
+                b.connect("clicked", lambda _b, d=d: self.net.disconnect(d, lambda e: e and self.flash(self.explain(e))))
             elif plugged:
                 b.set_tooltip_text("Click to connect")
-                b.connect("clicked", lambda _b, d=d: self.net.connect_wired(d, lambda e: e and self.flash(e)))
+                b.connect("clicked", lambda _b, d=d: self.net.connect_wired(d, lambda e: e and self.flash(self.explain(e))))
             self.wired_box.pack_start(b, False, False, 0)
         self.wired_box.show_all()
+
+    def _switch_row(self, name, icon, sub, active, on_toggle, sensitive=True):
+        row = Gtk.Box(spacing=10); row.get_style_context().add_class("en-row")
+        row.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON), False, False, 0)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        nl = Gtk.Label(label=name, xalign=0, ellipsize=Pango.EllipsizeMode.END); col.pack_start(nl, False, False, 0)
+        if sub:
+            sl = Gtk.Label(label=sub, xalign=0, ellipsize=Pango.EllipsizeMode.END); sl.get_style_context().add_class("en-dim")
+            col.pack_start(sl, False, False, 0)
+        row.pack_start(col, True, True, 0)
+        sw = Gtk.Switch(active=active, valign=Gtk.Align.CENTER, sensitive=sensitive)
+        sw.connect("notify::active", lambda s_, _p: None if self._updating else on_toggle(s_.get_active()))
+        row.pack_end(sw, False, False, 0)
+        return row
+
+    def _section(self, box, title):
+        for c in box.get_children(): c.destroy()
+        h = Gtk.Label(label=title, xalign=0); h.get_style_context().add_class("en-section")
+        box.pack_start(h, False, False, 0)
+
+    def _ac_state(self, ac):
+        if not ac: return "off"
+        st = ac.get_state()
+        if st == NM.ActiveConnectionState.ACTIVATED: return "on"
+        if st in (NM.ActiveConnectionState.ACTIVATING,): return "connecting"
+        return "off"
+
+    def refresh_vpn(self):
+        ts = self.net.tailscale
+        vpns = self.net.by_type("vpn", "wireguard")
+        has_ts = ts.get("state") in ("Running", "Stopped", "NeedsLogin", "Starting")
+        if not vpns and not has_ts:
+            for c in self.vpn_box.get_children(): c.destroy()
+            return
+        self._section(self.vpn_box, "VPN")
+        if has_ts:
+            sub = self.busy.get("tailscale") or {"Running": f"On · {ts.get('ip', '')}", "Stopped": "Off", "Starting": "Starting…",
+                   "NeedsLogin": "Needs sign-in: run “tailscale up” once"}[ts["state"]]
+            self.vpn_box.pack_start(self._switch_row("Tailscale", "network-vpn-symbolic", sub,
+                                                     ts["state"] in ("Running", "Starting"), self.toggle_tailscale,
+                                                     ts["state"] != "NeedsLogin"), False, False, 0)
+        for conn in vpns:
+            ac = self.net.active_for(conn)
+            state = self._ac_state(ac)
+            sub = self.busy.get(conn.get_uuid()) or {"on": "Connected", "connecting": "Connecting…", "off": "Off"}[state]
+            self.vpn_box.pack_start(self._switch_row(conn.get_id(), "network-vpn-symbolic", sub, state != "off",
+                                                     lambda on, c=conn: self.toggle_conn(c, on, "vpn")), False, False, 0)
+        self.vpn_box.show_all()
+
+    def refresh_tether(self):
+        teth = self.net.by_type("bluetooth")
+        if not teth:
+            for c in self.tether_box.get_children(): c.destroy()
+            return
+        self._section(self.tether_box, "Phone internet")
+        for conn in teth:
+            ac = self.net.active_for(conn)
+            state = self._ac_state(ac)
+            sub = self.busy.get(conn.get_uuid()) or {"on": "Connected through your phone", "connecting": "Connecting…",
+                                                     "off": "Bluetooth tethering"}[state]
+            name = conn.get_id().replace("Bluetooth Tethering — ", "").replace(" Network", "")
+            self.tether_box.pack_start(self._switch_row(name, "phone-symbolic", sub, state != "off",
+                                                        lambda on, c=conn: self.toggle_conn(c, on, "tether")), False, False, 0)
+        self.tether_box.show_all()
+
+    def toggle_conn(self, conn, on, kind):
+        uid = conn.get_uuid()
+        def done(err):
+            self.busy.pop(uid, None)
+            if err: self.flash(f"{conn.get_id()}: " + self.explain(err, kind))
+            self.refresh()
+        if on:
+            self.busy[uid] = "Connecting…"
+            self.net.activate(conn, done)
+        else:
+            ac = self.net.active_for(conn)
+            if ac:
+                self.busy[uid] = "Disconnecting…"
+                self.net.deactivate(ac, done)
+        self.refresh()
+
+    def explain(self, err, kind=""):
+        e = err.lower()
+        if "not authorized" in e or "permission" in e:
+            return "not allowed from here. Reopen EasyNet from the app menu (or log out and back in)."
+        if kind == "tether" and any(k in e for k in ("bluetooth", "no suitable device", "not available", "timeout", "failed")):
+            return "couldn't reach the phone. Turn on Bluetooth tethering on the phone and keep it nearby."
+        if "secrets" in e:
+            return "needs a password or sign-in."
+        return err.split(":")[-1].strip() or "failed"
 
     def _row(self, name, icon, sub, active=False, extra_icon=None):
         b = Gtk.Button(relief=Gtk.ReliefStyle.NONE); ctx = b.get_style_context(); ctx.add_class("en-row")
@@ -532,7 +630,9 @@ class App(Gtk.Application):
             self.wifi_note.set_text("Off while docked: Wi-Fi turns itself back on when you unplug the dock."
                                     if docked and os.path.exists(DOCK_SCRIPT) else "Wi-Fi is off.")
             return
-        nets = self.net.networks()
+        nets = self.net.networks() if on and d and hw else []
+        self.wifi_scroll.set_visible(bool(nets))
+        if nets: self.wifi_scroll.get_child().show_all()
         if not nets:
             self.wifi_note.set_text("Looking for networks…"); return
         self.wifi_note.set_text("")
@@ -557,12 +657,12 @@ class App(Gtk.Application):
     # ---- actions ----
     def on_wifi_switch(self, sw, _p):
         if self._updating: return
-        self.net.set_wifi(sw.get_active())
+        self.net.set_wifi(sw.get_active(), lambda e: e and (self.flash("Wi-Fi: " + self.explain(e)), self.refresh()))
 
     def on_network(self, ssid, ap, saved, is_active):
         d = self.net.wifi_dev()
         if is_active:
-            self.net.disconnect(d, lambda e: e and self.flash(e)); return
+            self.net.disconnect(d, lambda e: e and self.flash(self.explain(e))); return
         def done(err):
             self.busy.pop(ssid, None)
             if err:
@@ -606,8 +706,12 @@ class App(Gtk.Application):
         return pw if ok else None
 
     def toggle_tailscale(self, on):
-        self.ts_detail.set_text("Turning on…" if on else "Turning off…")
-        self.net.set_tailscale(on, lambda err: (err and self.flash("Tailscale: " + err), self.refresh()))
+        self.busy["tailscale"] = "Turning on…" if on else "Turning off…"
+        def done(err):
+            self.busy.pop("tailscale", None)
+            if err: self.flash("Tailscale: " + self.explain(err))
+            self.refresh()
+        self.net.set_tailscale(on, done)
 
     def open_portal(self):
         Gio.AppInfo.launch_default_for_uri(PORTAL_PROBE, None)
