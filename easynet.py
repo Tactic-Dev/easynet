@@ -17,7 +17,7 @@ try:
 except (ValueError, ImportError):
     XApp = None
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 APP_ID = "dev.tacticdev.easynet"
 AP_FLAGS = getattr(NM, "80211ApFlags")
 AP_SEC = getattr(NM, "80211ApSecurityFlags")
@@ -373,6 +373,9 @@ class App(Gtk.Application):
         w.set_keep_above(True); w.set_skip_taskbar_hint(True); w.set_skip_pager_hint(True)
         w.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
         w.connect("focus-out-event", lambda *_: (GLib.timeout_add(150, self._maybe_hide), False)[-1])
+        self._live = None
+        w.connect("map", lambda *_: self._start_live())
+        w.connect("unmap", lambda *_: self._stop_live())
         w.connect("key-press-event", lambda _w, ev: (w.hide(), True)[-1] if ev.keyval == Gdk.KEY_Escape else False)
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
         card.get_style_context().add_class("en-card"); card.set_size_request(360, -1)
@@ -430,6 +433,23 @@ class App(Gtk.Application):
         card.pack_start(self.toast, False, False, 0)
         w.add(card)
         self.win = w
+
+    def _start_live(self):
+        """While the panel is open: rescan every 10 s (about the fastest Wi-Fi hardware allows) and
+        refresh signal strengths every 3 s. Stops as soon as the panel closes."""
+        self._stop_live()
+        self._live_ticks = 0
+        def tick():
+            self._live_ticks += 1
+            if self._live_ticks % 3 == 1:
+                self.net.scan()
+            self.refresh_wifi()
+            return True
+        self._live = GLib.timeout_add_seconds(3, tick)
+
+    def _stop_live(self):
+        if self._live:
+            GLib.source_remove(self._live); self._live = None
 
     def _maybe_hide(self):
         if self.win.get_visible() and not self.win.is_active() and not getattr(self, "_dialog_open", False):
@@ -614,8 +634,11 @@ class App(Gtk.Application):
         b.add(row)
         return b
 
-    def refresh_wifi(self):
+    def _clear_wifi_list(self):
+        self._wifi_sig = None
         for c in self.wifi_list.get_children(): c.destroy()
+
+    def refresh_wifi(self):
         d = self.net.wifi_dev()
         hw = self.net.c.wireless_hardware_get_enabled()
         on = self.net.c.wireless_get_enabled()
@@ -623,22 +646,35 @@ class App(Gtk.Application):
         docked = any(w.get_state() == NM.DeviceState.ACTIVATED and w.get_iface().startswith("enx")
                      for w in self.net.wired_devs())
         if not d:
+            self._clear_wifi_list()
             self.wifi_note.set_text("No Wi-Fi adapter found."); return
         if not hw:
+            self._clear_wifi_list()
             self.wifi_note.set_text("Wi-Fi is switched off by the hardware (airplane-mode key)."); return
         if not on:
             self.wifi_note.set_text("Off while docked: Wi-Fi turns itself back on when you unplug the dock."
                                     if docked and os.path.exists(DOCK_SCRIPT) else "Wi-Fi is off.")
+            self._clear_wifi_list(); self.wifi_scroll.hide()
             return
         nets = self.net.networks() if on and d and hw else []
         self.wifi_scroll.set_visible(bool(nets))
         if nets: self.wifi_scroll.get_child().show_all()
         if not nets:
             self.wifi_note.set_text("Looking for networks…")
+            self._clear_wifi_list()
             return
         self.wifi_note.set_text("")
         active = d.get_active_access_point()
         active_ssid = ssid_text(active.get_ssid()) if active else None
+        # Only redraw when something visible changed, so the list doesn't flicker under the mouse
+        # while the panel is open and refreshing.
+        sig = tuple((ssid, signal_icon(ap.get_strength()), ap_security(ap), bool(self.net.saved_for_ssid(ssid)),
+                     ssid == active_ssid and d.get_state() == NM.DeviceState.ACTIVATED, self.busy.get(ssid))
+                    for ssid, ap in nets[:12])
+        if sig == getattr(self, "_wifi_sig", None):
+            return
+        self._wifi_sig = sig
+        for c in self.wifi_list.get_children(): c.destroy()
         for ssid, ap in nets[:12]:
             sec = ap_security(ap)
             saved = self.net.saved_for_ssid(ssid)

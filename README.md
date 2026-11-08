@@ -1,4 +1,4 @@
-# EasyNet 1.2.0
+# EasyNet 1.2.1
 
 A simple, clear network tray icon for Linux desktops (GTK3 + NetworkManager/libnm). Replaces Cinnamon's network applet.
 
