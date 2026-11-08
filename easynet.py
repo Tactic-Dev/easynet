@@ -17,8 +17,38 @@ try:
 except (ValueError, ImportError):
     XApp = None
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 APP_ID = "dev.tacticdev.easynet"
+
+# --- shared by the TACTICDEV Easy* tray apps -------------------------------------------------
+# Only one tray panel open at a time: opening one tells the others (over the session bus) to close.
+TRAY_IFACE, TRAY_PATH = "dev.tacticdev.Tray", "/dev/tacticdev/tray"
+
+def tray_announce():
+    try:
+        Gio.bus_get_sync(Gio.BusType.SESSION, None).emit_signal(
+            None, TRAY_PATH, TRAY_IFACE, "Opened", GLib.Variant("(s)", (APP_ID,)))
+    except GLib.Error:
+        pass
+
+def tray_listen(hide):
+    Gio.bus_get_sync(Gio.BusType.SESSION, None).signal_subscribe(
+        None, TRAY_IFACE, "Opened", TRAY_PATH, None, Gio.DBusSignalFlags.NONE,
+        lambda c, s, p, i, n, params: params.unpack()[0] != APP_ID and hide())
+
+def add_restart_action(app):
+    """Self-restart that stays inside the desktop session (system permissions depend on it).
+    Trigger: gdbus call --session -d <APP_ID> -o /<APP_ID with dots as slashes>
+             -m org.freedesktop.Application.ActivateAction restart [] {}"""
+    act = Gio.SimpleAction.new("restart", None)
+    def restart(*_):
+        script = (f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
+                  f"exec {sys.executable} {os.path.abspath(__file__)} --hidden")
+        subprocess.Popen(["sh", "-c", script])
+        app.quit()
+    act.connect("activate", restart)
+    app.add_action(act)
+# ---------------------------------------------------------------------------------------------
 AP_FLAGS = getattr(NM, "80211ApFlags")
 AP_SEC = getattr(NM, "80211ApSecurityFlags")
 PORTAL_PROBE = "http://neverssl.com/"   # plain-http page; hotel portals hijack it and show their login
@@ -284,6 +314,8 @@ class App(Gtk.Application):
         self.net.enable_portal_check()
         self.build()
         self.setup_tray()
+        tray_listen(lambda: self.win.get_visible() and self.win.hide())
+        add_restart_action(self)
         self.last_conn = None
         self.refresh()
 
@@ -459,6 +491,7 @@ class App(Gtk.Application):
     def toggle(self):
         if self.win.get_visible():
             self.win.hide(); return
+        tray_announce()
         self.net.scan()
         self.toast.set_text("")
         self.refresh()
