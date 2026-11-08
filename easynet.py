@@ -17,7 +17,7 @@ try:
 except (ValueError, ImportError):
     XApp = None
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_ID = "dev.tacticdev.easynet"
 AP_FLAGS = getattr(NM, "80211ApFlags")
 AP_SEC = getattr(NM, "80211ApSecurityFlags")
@@ -352,8 +352,8 @@ class App(Gtk.Application):
         m.append(Gtk.SeparatorMenuItem())
         if self.net.wifi_dev():
             on = self.net.c.wireless_get_enabled()
-            item("Turn Wi-Fi off" if on else "Turn Wi-Fi on",
-                 lambda: self.net.set_wifi(not on, lambda e: e and self.flash("Wi-Fi: " + self.explain(e))))
+            item("Switch back to wired" if on and self.net.wired_devs() else "Turn Wi-Fi off" if on else "Switch to Wi-Fi",
+                 lambda: self.use_wifi(not on))
         if self.net.tailscale.get("state") in ("Running", "Stopped"):
             running = self.net.tailscale["state"] == "Running"
             item("Turn Tailscale off" if running else "Turn Tailscale on", lambda: self.toggle_tailscale(not running))
@@ -634,7 +634,8 @@ class App(Gtk.Application):
         self.wifi_scroll.set_visible(bool(nets))
         if nets: self.wifi_scroll.get_child().show_all()
         if not nets:
-            self.wifi_note.set_text("Looking for networks…"); return
+            self.wifi_note.set_text("Looking for networks…")
+            return
         self.wifi_note.set_text("")
         active = d.get_active_access_point()
         active_ssid = ssid_text(active.get_ssid()) if active else None
@@ -657,7 +658,28 @@ class App(Gtk.Application):
     # ---- actions ----
     def on_wifi_switch(self, sw, _p):
         if self._updating: return
-        self.net.set_wifi(sw.get_active(), lambda e: e and (self.flash("Wi-Fi: " + self.explain(e)), self.refresh()))
+        self.use_wifi(sw.get_active())
+
+    def use_wifi(self, on):
+        """Wi-Fi on = switch over to Wi-Fi: radio on, wired off, scan and list networks.
+        Wi-Fi off = back to wired: radio off, reconnect any plugged-in cable."""
+        def after(err):
+            if err:
+                self.flash("Wi-Fi: " + self.explain(err)); self.refresh(); return
+            if on:
+                for d in self.net.wired_devs():
+                    if d.get_state() >= NM.DeviceState.PREPARE:
+                        self.net.disconnect(d, lambda e: e and self.flash(self.explain(e)))
+                self.wifi_note.set_text("Looking for networks…")
+                # The radio needs a moment before it accepts scan requests; ask a few times.
+                for delay in (1500, 4000, 9000):
+                    GLib.timeout_add(delay, lambda: (self.net.scan(), self.refresh(), False)[-1])
+            else:
+                for d in self.net.wired_devs():
+                    if d.get_carrier() and d.get_state() < NM.DeviceState.PREPARE:
+                        self.net.connect_wired(d, lambda e: e and self.flash(self.explain(e)))
+            self.refresh()
+        self.net.set_wifi(on, after)
 
     def on_network(self, ssid, ap, saved, is_active):
         d = self.net.wifi_dev()
